@@ -1,0 +1,1 @@
+from stego_lib.formats.header import StegoHeader
