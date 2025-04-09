@@ -57,9 +57,19 @@ class ImageContainer:
 
     @time_it
     def calculate_batch_capacity(self, image_paths):
-        """Calcula la capacidad total de un conjunto de imágenes."""
+        """
+        Calcula la capacidad total, usada y restante de un conjunto de imágenes.
+
+        Args:
+            image_paths: Lista de rutas a imágenes PNG
+
+        Returns:
+            tuple: (capacidad_total, capacidades_individuales, info_espacio)
+                   donde info_espacio contiene (usado, disponible, total) para cada imagen
+        """
         total_capacity = 0
         individual_capacities = {}
+        space_info = {}  # Nuevo diccionario para almacenar información de espacio
 
         log_debug(f"Calculando capacidad para {len(image_paths)} imágenes")
 
@@ -67,10 +77,59 @@ class ImageContainer:
             capacity = self.calculate_capacity(path)
             individual_capacities[path] = capacity
             total_capacity += capacity
-            log_debug(f"  - {path}: {capacity} bytes ({capacity / 1024:.2f} KB)")
+
+            # Calcular espacio usado y disponible
+            try:
+                # Intentar leer datos existentes para verificar si hay un mensaje
+                raw_data = self.read_data(path)
+                bytes_used = 0
+                bytes_available = capacity
+
+                if raw_data and len(raw_data) >= StegoHeader.SIZE:
+                    try:
+                        # Extraer el encabezado
+                        header = StegoHeader.parse(raw_data[:StegoHeader.SIZE])
+
+                        # Si el mensaje continúa en otras imágenes, todo el espacio está usado
+                        if header.has_next_part:
+                            bytes_used = capacity
+                            bytes_available = 0
+                        else:
+                            # Calcular parte del mensaje en esta imagen
+                            part_length = min(
+                                len(raw_data) - StegoHeader.SIZE,
+                                header.total_length - header.current_offset
+                            )
+                            bytes_used = part_length + StegoHeader.SIZE
+                            bytes_available = capacity - bytes_used
+                    except Exception:
+                        # Si no se puede extraer el encabezado, asumimos que no hay datos
+                        pass
+
+                # Guardar la información de espacio
+                space_info[path] = (bytes_used, bytes_available, capacity)
+
+                # Log detallado con información de uso
+                percent_used = (bytes_used / capacity * 100) if capacity > 0 else 0
+                log_debug(f"  - {path}: {capacity} bytes ({capacity / 1024:.2f} KB) | "
+                          f"Usado: {bytes_used} bytes ({percent_used:.1f}%) | "
+                          f"Disponible: {bytes_available} bytes")
+
+            except Exception as e:
+                log_debug(f"  - {path}: Error al analizar espacio: {e}")
+                space_info[path] = (0, capacity, capacity)  # En caso de error, asumimos vacía
 
         log_debug(f"Capacidad total: {total_capacity} bytes ({total_capacity / 1024:.2f} KB)")
-        return total_capacity, individual_capacities
+
+        # Calcular totales de espacio usado/disponible
+        total_used = sum(used for used, _, _ in space_info.values())
+        total_available = sum(available for _, available, _ in space_info.values())
+
+        percent_used_total = (total_used / total_capacity * 100) if total_capacity > 0 else 0
+        log_debug(f"Espacio total usado: {total_used} bytes ({total_used / 1024:.2f} KB) - {percent_used_total:.1f}%")
+        log_debug(f"Espacio total disponible: {total_available} bytes ({total_available / 1024:.2f} KB)")
+
+        return total_capacity, individual_capacities, space_info
 
     def write_data(self, input_path, output_path, data):
         """
@@ -138,12 +197,6 @@ class ImageContainer:
     def read_data(self, image_path):
         """
         Lee datos ocultos en una imagen.
-
-        Args:
-            image_path: Ruta a la imagen con datos ocultos
-
-        Returns:
-            bytes: Datos extraídos
         """
         try:
             # Cargar la imagen
@@ -153,42 +206,11 @@ class ImageContainer:
             pixels = np.array(img)
             pixels_flat = pixels.reshape(-1)
 
-            # Extraer los bits ocultos
-            extracted_bits = []
-            for pixel_value in pixels_flat:
-                # Extraer los bits menos significativos
-                for j in range(self.bits_per_channel):
-                    extracted_bits.append((pixel_value >> j) & 1)
-
-                if len(extracted_bits) >= StegoHeader.SIZE * 8:
-                    # Ya tenemos suficientes bits para el encabezado
-                    break
-
-            # Reconstruir los bytes del encabezado
-            header_bytes = bytearray()
-            for i in range(0, StegoHeader.SIZE * 8, 8):
-                if i + 8 > len(extracted_bits):
-                    break
-                byte = 0
-                for j in range(8):
-                    byte = (byte << 1) | extracted_bits[i + j]
-                header_bytes.append(byte)
-
-            # Analizar el encabezado
-            header = StegoHeader.parse(header_bytes)
-
-            # Determinar cuántos bits más necesitamos para el mensaje completo
-            remaining_bits = (header.total_length - header.current_offset) * 8
-            total_bits_needed = StegoHeader.SIZE * 8 + remaining_bits
-
-            # Si necesitamos más bits, continuar extrayendo
+            # Extraer todos los bits ocultos de una vez
             extracted_bits = []
             for pixel_value in pixels_flat:
                 for j in range(self.bits_per_channel):
                     extracted_bits.append((pixel_value >> j) & 1)
-
-                if len(extracted_bits) >= total_bits_needed:
-                    break
 
             # Convertir los bits a bytes
             data = bytearray()
