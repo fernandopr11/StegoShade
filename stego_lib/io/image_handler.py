@@ -5,6 +5,7 @@ Manejo de imágenes para esteganografía.
 import numpy as np
 from PIL import Image
 from stego_lib.formats.header import StegoHeader
+from stego_lib.utils.debug import log_debug, time_it
 
 
 class ImageContainer:
@@ -54,24 +55,21 @@ class ImageContainer:
         except Exception as e:
             raise IOError(f"Error al calcular la capacidad de {image_path}: {e}")
 
+    @time_it
     def calculate_batch_capacity(self, image_paths):
-        """
-        Calcula la capacidad total de un conjunto de imágenes.
-
-        Args:
-            image_paths: Lista de rutas a imágenes
-
-        Returns:
-            tuple: (capacidad_total, {ruta: capacidad, ...})
-        """
+        """Calcula la capacidad total de un conjunto de imágenes."""
         total_capacity = 0
         individual_capacities = {}
+
+        log_debug(f"Calculando capacidad para {len(image_paths)} imágenes")
 
         for path in image_paths:
             capacity = self.calculate_capacity(path)
             individual_capacities[path] = capacity
             total_capacity += capacity
+            log_debug(f"  - {path}: {capacity} bytes ({capacity / 1024:.2f} KB)")
 
+        log_debug(f"Capacidad total: {total_capacity} bytes ({total_capacity / 1024:.2f} KB)")
         return total_capacity, individual_capacities
 
     def write_data(self, input_path, output_path, data):
