@@ -31,14 +31,7 @@ class StegoEncoder:
     @time_it
     def encode(self, message, directory):
         """
-        Oculta un mensaje en un directorio de imágenes PNG.
-
-        Args:
-            message: Mensaje a ocultar (bytes o str).
-            directory: Directorio que contiene las imágenes PNG.
-
-        Returns:
-            list: Rutas a las imágenes modificadas con el mensaje oculto.
+        Oculta un mensaje en un directorio de imágenes PNG sin sobrescribir mensajes anteriores.
         """
         log_debug(f"Iniciando codificación en directorio: {directory}")
 
@@ -52,111 +45,87 @@ class StegoEncoder:
 
         # Asegurar que el mensaje esté en bytes
         if isinstance(message, str):
-            log_debug(f"Convirtiendo mensaje a bytes (tamaño original: {len(message)} caracteres)")
             message = message.encode('utf-8')
 
         log_debug(f"Tamaño del mensaje a ocultar: {len(message)} bytes")
 
-        # Leer mensajes existentes
-        existing_message = b""
-        decoder = StegoDecoder(password=self.cipher.password, bits_per_channel=self.bits_per_channel)
-        try:
-            log_debug("Intentando leer mensajes existentes...")
-            start_time = time.time()
-            existing_message = decoder.decode(image_paths)
-            decode_time = time.time() - start_time
-            log_debug(f"Mensaje existente encontrado: {len(existing_message)} bytes (en {decode_time:.4f} segundos)")
-        except Exception as e:
-            log_debug(f"No se encontraron mensajes existentes: {str(e)}")
-            pass
-
-        # Concatenar el mensaje nuevo con los existentes
-        combined_message = existing_message + b"\n" + message if existing_message else message
-        log_debug(f"Tamaño del mensaje combinado: {len(combined_message)} bytes")
-
         # Verificar que hay espacio suficiente
         log_debug("Calculando capacidad disponible en las imágenes...")
-        total_capacity, individual_capacities = self.container.calculate_batch_capacity(image_paths)
-        log_debug(f"Capacidad total disponible: {total_capacity} bytes ({total_capacity / 1024:.2f} KB)")
+        total_capacity, individual_capacities, space_info = self.container.calculate_batch_capacity(image_paths)
 
-        for img_path, capacity in individual_capacities.items():
-            log_debug(f"  - {os.path.basename(img_path)}: {capacity} bytes ({capacity / 1024:.2f} KB)")
+        # Calcular el espacio realmente disponible
+        total_available = sum(available for _, available, _ in space_info.values())
+        log_debug(
+            f"Espacio total disponible: {total_available} bytes ({total_available / 1024:.2f} KB, {total_available / (1024 * 1024):.3f} MB)")
 
-        if len(combined_message) > total_capacity:
+        # Mostrar información detallada de cada imagen
+        for img_path, (used, available, capacity) in space_info.items():
+            percent_used = (used / capacity * 100) if capacity > 0 else 0
+            log_debug(f"  - {os.path.basename(img_path)}: Capacidad: {capacity} bytes | "
+                      f"Usado: {used} bytes ({percent_used:.1f}%) | "
+                      f"Disponible: {available} bytes")
+
+        if len(message) > total_available:
             log_debug(f"Error: Mensaje demasiado grande para la capacidad disponible")
             raise ValueError(
-                f"El mensaje combinado es demasiado grande ({len(combined_message)} bytes) para las imágenes proporcionadas (capacidad: {total_capacity} bytes)")
+                f"El mensaje es demasiado grande ({len(message)} bytes) para la capacidad disponible ({total_available} bytes)")
 
-        # Generar hash del mensaje combinado
-        log_debug("Generando hash del mensaje...")
-        start_time = time.time()
-        message_hash = create_message_hash(combined_message)
-        hash_time = time.time() - start_time
-        log_debug(f"Hash generado en {hash_time:.4f} segundos")
-
-        # Cifrar el mensaje combinado si se proporcionó contraseña
+        # Generar hash y cifrar mensaje
+        message_hash = create_message_hash(message)
         if self.cipher:
-            log_debug("Cifrando mensaje...")
-            start_time = time.time()
-            combined_message = self.cipher.encrypt(combined_message)
-            encrypt_time = time.time() - start_time
-            log_debug(f"Mensaje cifrado: {len(combined_message)} bytes (en {encrypt_time:.4f} segundos)")
+            message = self.cipher.encrypt(message)
 
-        # Dividir y almacenar el mensaje combinado en las imágenes
+        # Generar un ID único para el mensaje
+        message_id = int(time.time())  # Usar timestamp como ID único
+
+        # Ordenar imágenes por espacio disponible (de mayor a menor)
+        sorted_images = sorted(
+            [(img_path, space_info[img_path][1]) for img_path in image_paths if space_info[img_path][1] > 0],
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        # Dividir y almacenar el mensaje en las imágenes
         bytes_written = 0
-        bytes_remaining = len(combined_message)
+        bytes_remaining = len(message)
         modified_images = []
 
         log_debug(f"Iniciando escritura de {bytes_remaining} bytes en imágenes...")
 
-        for i, img_path in enumerate(image_paths):
+        for img_path, available in sorted_images:
             if bytes_remaining <= 0:
-                log_debug(f"Escritura completa. No quedan bytes por escribir.")
                 break
 
-            # Calcular cuántos bytes caben en esta imagen
-            capacity = self.container.calculate_capacity(img_path)
-            log_debug(f"Imagen {i + 1}/{len(image_paths)}: {os.path.basename(img_path)}, capacidad: {capacity} bytes")
-
-            # Determinar cuánto vamos a escribir en esta imagen
-            bytes_to_write = min(capacity, bytes_remaining)
-
-            if bytes_to_write <= 0:
-                log_debug(f"Omitiendo {os.path.basename(img_path)}: no hay espacio suficiente")
+            if available <= 0:
+                log_debug(f"Saltando imagen {os.path.basename(img_path)}: sin espacio disponible")
                 continue
 
-            # Crear encabezado para esta imagen
-            has_next = bytes_written + bytes_to_write < len(combined_message)
-            log_debug(f"Creando encabezado: offset={bytes_written}, "
-                      f"has_next_part={has_next}, bytes_to_write={bytes_to_write}")
+            log_debug(
+                f"Imagen: {os.path.basename(img_path)}, espacio disponible: {available} bytes")
 
+            # Determinar cuánto escribir en esta imagen
+            bytes_to_write = min(available - StegoHeader.SIZE, bytes_remaining)
+            if bytes_to_write <= 0:
+                continue
+
+            # Crear encabezado y escribir datos
             header = StegoHeader.create(
-                total_message_length=len(combined_message),
+                total_message_length=len(message),
                 current_offset=bytes_written,
                 message_hash=message_hash,
-                has_next_part=has_next
+                message_id=message_id
             )
 
-            # Extraer la parte correspondiente del mensaje
-            message_part = combined_message[bytes_written:bytes_written + bytes_to_write]
-
-            # Escribir en la imagen original (sobrescribir)
-            log_debug(f"Escribiendo {bytes_to_write} bytes en {os.path.basename(img_path)}...")
-            start_time = time.time()
-            self.container.write_data(
-                img_path,
-                img_path,  # Sobrescribe la imagen original
-                header + message_part
-            )
-            write_time = time.time() - start_time
-            log_debug(f"Escritura completada en {write_time:.4f} segundos")
+            # Extraer parte del mensaje y escribir
+            message_part = message[bytes_written:bytes_written + bytes_to_write]
+            self.container.write_data(img_path, img_path, header + message_part)
 
             modified_images.append(img_path)
             bytes_written += bytes_to_write
             bytes_remaining -= bytes_to_write
 
-            progress = (bytes_written / len(combined_message)) * 100
-            log_debug(f"Progreso: {bytes_written}/{len(combined_message)} bytes ({progress:.1f}%)")
+            progress = (bytes_written / len(message)) * 100
+            log_debug(f"Progreso: {bytes_written}/{len(message)} bytes ({progress:.1f}%)")
 
         log_debug(f"Codificación completa: {bytes_written} bytes escritos en {len(modified_images)} imágenes")
         return modified_images

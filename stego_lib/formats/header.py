@@ -10,7 +10,7 @@ class StegoHeader:
     """Encabezado para los datos ocultos en imágenes."""
 
     # Tamaño total del encabezado en bytes
-    SIZE = 32
+    SIZE = 36
     # Firma para identificar archivos estego
     MAGIC = b'STEG'
 
@@ -21,10 +21,10 @@ class StegoHeader:
     total_length: int  # Longitud total del mensaje en bytes
     current_offset: int  # Posición actual en el mensaje
     message_hash: bytes  # Hash para verificación
-    has_next_part: bool  # Indica si hay más partes del mensaje
+    message_id: int  # ID único del mensaje
 
     @classmethod
-    def create(cls, total_message_length, current_offset, message_hash, has_next_part=False):
+    def create(cls, total_message_length, current_offset, message_hash, message_id):
         """
         Crea un nuevo encabezado y lo serializa.
 
@@ -32,7 +32,7 @@ class StegoHeader:
             total_message_length: Longitud total del mensaje
             current_offset: Posición actual en el mensaje
             message_hash: Hash del mensaje completo
-            has_next_part: Indica si hay más partes del mensaje
+            message_id: ID único del mensaje
 
         Returns:
             bytes: Encabezado serializado
@@ -54,10 +54,8 @@ class StegoHeader:
         # Hash (8 bytes, truncado del hash original)
         header[21:29] = message_hash[:8]
 
-        # Flag de continuación (1 byte)
-        header[29] = 1 if has_next_part else 0
-
-        # Los bytes restantes quedan en 0 (reservados)
+        # ID del mensaje (4 bytes)
+        struct.pack_into('>I', header, 29, message_id)
 
         return bytes(header)
 
@@ -67,7 +65,7 @@ class StegoHeader:
         Analiza un encabezado serializado.
 
         Args:
-            header_bytes: Bytes del encabezado (32 bytes)
+            header_bytes: Bytes del encabezado (36 bytes)
 
         Returns:
             StegoHeader: Objeto con la información del encabezado
@@ -91,11 +89,11 @@ class StegoHeader:
         total_length = struct.unpack('>Q', header_bytes[5:13])[0]
         current_offset = struct.unpack('>Q', header_bytes[13:21])[0]
         message_hash = header_bytes[21:29]
-        has_next_part = bool(header_bytes[29])
+        message_id = struct.unpack('>I', header_bytes[29:33])[0]
 
         return cls(
             total_length=total_length,
             current_offset=current_offset,
             message_hash=message_hash,
-            has_next_part=has_next_part
+            message_id=message_id
         )
