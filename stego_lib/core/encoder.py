@@ -9,7 +9,6 @@ from stego_lib.crypto.hash import create_message_hash
 from stego_lib.formats.header import StegoHeader
 from stego_lib.io.directory_handler import get_png_images
 from stego_lib.io.image_handler import ImageContainer
-from stego_lib.core.decoder import StegoDecoder
 from stego_lib.utils.debug import log_debug, time_it
 
 
@@ -31,7 +30,8 @@ class StegoEncoder:
     @time_it
     def encode(self, message, directory):
         """
-        Oculta un mensaje en un directorio de imágenes PNG sin sobrescribir mensajes anteriores.
+        Oculta un mensaje en un directorio de imágenes PNG.
+        Llena una imagen completamente antes de pasar a la siguiente.
         """
         log_debug(f"Iniciando codificación en directorio: {directory}")
 
@@ -53,11 +53,6 @@ class StegoEncoder:
         log_debug("Calculando capacidad disponible en las imágenes...")
         total_capacity, individual_capacities, space_info = self.container.calculate_batch_capacity(image_paths)
 
-        # Calcular el espacio realmente disponible
-        total_available = sum(available for _, available, _ in space_info.values())
-        log_debug(
-            f"Espacio total disponible: {total_available} bytes ({total_available / 1024:.2f} KB, {total_available / (1024 * 1024):.3f} MB)")
-
         # Mostrar información detallada de cada imagen
         for img_path, (used, available, capacity) in space_info.items():
             percent_used = (used / capacity * 100) if capacity > 0 else 0
@@ -65,10 +60,18 @@ class StegoEncoder:
                       f"Usado: {used} bytes ({percent_used:.1f}%) | "
                       f"Disponible: {available} bytes")
 
-        if len(message) > total_available:
-            log_debug(f"Error: Mensaje demasiado grande para la capacidad disponible")
+        # Ordenar imágenes por espacio USADO (de mayor a menor)
+        # Esto hace que se llene primero una imagen antes de pasar a la siguiente
+        sorted_images = sorted(
+            [(img_path, space_info[img_path][1]) for img_path in image_paths if space_info[img_path][1] > 0],
+            key=lambda x: space_info[x[0]][0],  # Ordenar por bytes usados (columna 0 de space_info)
+            reverse=True  # Imágenes más llenas primero
+        )
+
+        if not sorted_images or sum(available for _, available in sorted_images) < len(message):
+            log_debug(f"Error: No hay suficiente espacio disponible para el mensaje")
             raise ValueError(
-                f"El mensaje es demasiado grande ({len(message)} bytes) para la capacidad disponible ({total_available} bytes)")
+                f"El mensaje es demasiado grande ({len(message)} bytes) para la capacidad disponible")
 
         # Generar hash y cifrar mensaje
         message_hash = create_message_hash(message)
@@ -78,54 +81,43 @@ class StegoEncoder:
         # Generar un ID único para el mensaje
         message_id = int(time.time())  # Usar timestamp como ID único
 
-        # Ordenar imágenes por espacio disponible (de mayor a menor)
-        sorted_images = sorted(
-            [(img_path, space_info[img_path][1]) for img_path in image_paths if space_info[img_path][1] > 0],
-            key=lambda x: x[1],
-            reverse=True
-        )
-
-        # Dividir y almacenar el mensaje en las imágenes
-        bytes_written = 0
-        bytes_remaining = len(message)
+        # Mantener seguimiento del offset actual en el mensaje
+        current_offset = 0
+        remaining_message = message
         modified_images = []
 
-        log_debug(f"Iniciando escritura de {bytes_remaining} bytes en imágenes...")
-
         for img_path, available in sorted_images:
-            if bytes_remaining <= 0:
-                break
-
-            if available <= 0:
-                log_debug(f"Saltando imagen {os.path.basename(img_path)}: sin espacio disponible")
+            if available <= StegoHeader.SIZE:
                 continue
 
-            log_debug(
-                f"Imagen: {os.path.basename(img_path)}, espacio disponible: {available} bytes")
+            # Comprobar cuántos bytes del mensaje podemos escribir en esta imagen
+            bytes_to_write = min(available - StegoHeader.SIZE, len(remaining_message))
 
-            # Determinar cuánto escribir en esta imagen
-            bytes_to_write = min(available - StegoHeader.SIZE, bytes_remaining)
-            if bytes_to_write <= 0:
-                continue
-
-            # Crear encabezado y escribir datos
+            # Crear encabezado con el offset correcto
             header = StegoHeader.create(
-                total_message_length=len(message),
-                current_offset=bytes_written,
+                total_message_length=len(message),  # Longitud total del mensaje original
+                current_offset=current_offset,  # Posición actual dentro del mensaje
                 message_hash=message_hash,
-                message_id=message_id
+                message_id=message_id  # Mantener el mismo ID para todos los fragmentos
             )
 
-            # Extraer parte del mensaje y escribir
-            message_part = message[bytes_written:bytes_written + bytes_to_write]
-            self.container.write_data(img_path, img_path, header + message_part)
-
+            # Escribir fragmento en la imagen
+            self.container.write_data(img_path, img_path, header + remaining_message[:bytes_to_write])
             modified_images.append(img_path)
-            bytes_written += bytes_to_write
-            bytes_remaining -= bytes_to_write
 
-            progress = (bytes_written / len(message)) * 100
-            log_debug(f"Progreso: {bytes_written}/{len(message)} bytes ({progress:.1f}%)")
+            log_debug(
+                f"Fragmento escrito en {os.path.basename(img_path)}: {bytes_to_write} bytes (offset={current_offset})")
 
-        log_debug(f"Codificación completa: {bytes_written} bytes escritos en {len(modified_images)} imágenes")
+            # Actualizar offset y mensaje restante
+            current_offset += bytes_to_write
+            remaining_message = remaining_message[bytes_to_write:]
+
+            # Si el mensaje está completo, terminamos
+            if len(remaining_message) == 0:
+                log_debug(f"Mensaje completo almacenado en {len(modified_images)} imágenes")
+                break
+
+            log_debug(f"Continúa en la siguiente imagen: {len(remaining_message)} bytes restantes")
+
+        log_debug(f"Codificación completa: mensaje escrito en {len(modified_images)} imágenes")
         return modified_images
