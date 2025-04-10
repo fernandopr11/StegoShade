@@ -29,107 +29,109 @@ class StegoDecoder:
     @time_it
     def decode(self, image_paths):
         """
-        Extrae un mensaje oculto de una serie de imágenes.
+        Extrae múltiples mensajes ocultos de una serie de imágenes.
 
         Args:
-            image_paths: Lista de rutas a imágenes con el mensaje oculto
+            image_paths: Lista de rutas a imágenes con los mensajes ocultos
 
         Returns:
-            bytes: Mensaje extraído
+            list: Lista de mensajes extraídos
         """
         log_debug(f"Iniciando decodificación de {len(image_paths)} imágenes")
 
-        message_parts = []
-        total_length = None
-        message_hash = None
-        bytes_read = 0
+        # Diccionario para agrupar partes de mensajes por ID
+        messages = {}
+
+        # Almacenar IDs de mensajes ya completados para evitar procesarlos nuevamente
+        completed_messages = set()
 
         for i, img_path in enumerate(image_paths):
             log_debug(f"Procesando imagen {i + 1}/{len(image_paths)}: {os.path.basename(img_path)}")
 
-            # Leer datos desde la imagen
-            start_time = time.time()
             try:
-                raw_data = self.container.read_data(img_path)
-                read_time = time.time() - start_time
-                log_debug(f"Lectura completada en {read_time:.4f} segundos")
+                # Leer todos los mensajes y fragmentos de esta imagen
+                raw_messages = self.container.read_all_messages(img_path)
+                log_debug(f"Encontrados {len(raw_messages)} segmentos de mensajes en {os.path.basename(img_path)}")
 
-                if not raw_data:
-                    log_debug(f"No se encontraron datos en {os.path.basename(img_path)}")
-                    continue
+                for raw_data in raw_messages:
+                    if not raw_data or len(raw_data) < StegoHeader.SIZE:
+                        continue
 
-                log_debug(f"Leídos {len(raw_data)} bytes de datos")
+                    try:
+                        # Extraer y validar el encabezado
+                        header = StegoHeader.parse(raw_data[:StegoHeader.SIZE])
+
+                        # Si este mensaje ya está completo, ignorarlo
+                        if header.message_id in completed_messages:
+                            continue
+
+                        log_debug(f"Encabezado extraído: longitud={header.total_length}, "
+                                  f"offset={header.current_offset}, id={header.message_id}")
+
+                        # Inicializar almacenamiento para el mensaje si es necesario
+                        if header.message_id not in messages:
+                            messages[header.message_id] = {
+                                "total_length": header.total_length,
+                                "message_hash": header.message_hash,
+                                "parts": bytearray(header.total_length),
+                                "bytes_read": 0
+                            }
+
+                        # Verificar consistencia del mensaje
+                        message_info = messages[header.message_id]
+                        if header.total_length != message_info["total_length"]:
+                            log_debug(
+                                f"Error de consistencia: longitud total inconsistente para id={header.message_id}")
+                            continue
+
+                        # Extraer los datos del mensaje (sin el encabezado)
+                        part_length = min(len(raw_data) - StegoHeader.SIZE, header.total_length - header.current_offset)
+                        message_part = raw_data[StegoHeader.SIZE:StegoHeader.SIZE + part_length]
+                        message_info["parts"][header.current_offset:header.current_offset + part_length] = message_part
+                        message_info["bytes_read"] += len(message_part)
+
+                        log_debug(
+                            f"Progreso para id={header.message_id}: {message_info['bytes_read']}/{message_info['total_length']} bytes")
+
+                        # Si el mensaje está completo, marcarlo
+                        if message_info["bytes_read"] >= message_info["total_length"]:
+                            log_debug(f"Mensaje id={header.message_id} completado")
+                            completed_messages.add(header.message_id)
+
+                    except Exception as e:
+                        log_debug(f"Error al procesar segmento: {str(e)}")
             except Exception as e:
-                log_debug(f"Error al leer datos de {os.path.basename(img_path)}: {str(e)}")
-                continue
+                log_debug(f"Error al procesar imagen {os.path.basename(img_path)}: {str(e)}")
 
-            # Extraer y validar el encabezado
-            try:
-                header = StegoHeader.parse(raw_data[:StegoHeader.SIZE])
-                log_debug(f"Encabezado extraído: longitud={header.total_length}, "
-                          f"offset={header.current_offset}, "
-                          f"has_next={header.has_next_part}")
-            except Exception as e:
-                log_debug(f"Error al procesar encabezado: {str(e)}")
-                continue
+        # Reconstruir y validar los mensajes
+        decoded_messages = []
+        for message_id, message_info in messages.items():
+            # Solo procesar mensajes completos
+            if message_info["bytes_read"] == message_info["total_length"]:
+                encrypted_message = bytes(message_info["parts"])
+                log_debug(f"Mensaje id={message_id} recopilado: {len(encrypted_message)} bytes")
 
-            # En la primera imagen obtenemos la longitud total y el hash
-            if total_length is None:
-                total_length = header.total_length
-                message_hash = header.message_hash
-                log_debug(f"Información del mensaje: tamaño total={total_length} bytes")
+                # Descifrar si es necesario
+                if self.cipher:
+                    log_debug(f"Descifrando mensaje id={message_id}...")
+                    try:
+                        decrypted_message = self.cipher.decrypt(encrypted_message)
+                    except Exception as e:
+                        log_debug(f"Error al descifrar mensaje id={message_id}: {str(e)}")
+                        continue
+                else:
+                    decrypted_message = encrypted_message
 
-            # Verificar que el encabezado sea consistente
-            if header.total_length != total_length or header.current_offset != bytes_read:
-                log_debug(f"Error de consistencia: offset esperado={bytes_read}, recibido={header.current_offset}")
-                raise ValueError(f"El encabezado de la imagen {img_path} es inconsistente con la secuencia esperada")
+                # Verificar el hash
+                log_debug(f"Verificando integridad del mensaje id={message_id}...")
+                if verify_message_hash(decrypted_message, message_info["message_hash"]):
+                    log_debug(f"Hash verificado correctamente para id={message_id}")
+                    decoded_messages.append(decrypted_message)
+                else:
+                    log_debug(f"Error: El hash del mensaje id={message_id} no coincide")
+            else:
+                log_debug(
+                    f"Mensaje id={message_id} incompleto: {message_info['bytes_read']}/{message_info['total_length']} bytes")
 
-            # Extraer los datos del mensaje (sin el encabezado)
-            part_length = min(len(raw_data) - StegoHeader.SIZE, total_length - bytes_read)
-            message_part = raw_data[StegoHeader.SIZE:StegoHeader.SIZE + part_length]
-
-            log_debug(f"Extrayendo {part_length} bytes de datos del mensaje")
-
-            message_parts.append(message_part)
-            bytes_read += len(message_part)
-
-            progress = (bytes_read / total_length) * 100 if total_length else 0
-            log_debug(f"Progreso: {bytes_read}/{total_length} bytes ({progress:.1f}%)")
-
-            # Si no hay más partes, terminamos
-            if not header.has_next_part:
-                log_debug("Se alcanzó el final del mensaje")
-                break
-
-        # Combinar las partes del mensaje
-        encrypted_message = b''.join(message_parts)
-        log_debug(f"Mensaje completo recopilado: {len(encrypted_message)} bytes")
-
-        # Descifrar si es necesario
-        if self.cipher:
-            log_debug("Descifrando mensaje...")
-            try:
-                start_time = time.time()
-                decrypted_message = self.cipher.decrypt(encrypted_message)
-                decrypt_time = time.time() - start_time
-                log_debug(f"Mensaje descifrado en {decrypt_time:.4f} segundos")
-            except Exception as e:
-                log_debug(f"Error al descifrar mensaje: {str(e)}")
-                raise ValueError(f"Error al descifrar: {e}. La contraseña podría ser incorrecta.")
-        else:
-            log_debug("No se requiere descifrado (sin contraseña)")
-            decrypted_message = encrypted_message
-
-        # Verificar el hash
-        log_debug("Verificando integridad del mensaje (hash)...")
-        start_time = time.time()
-        if verify_message_hash(decrypted_message, message_hash):
-            verify_time = time.time() - start_time
-            log_debug(f"Hash verificado correctamente en {verify_time:.4f} segundos")
-        else:
-            log_debug("Error: El hash del mensaje no coincide")
-            raise ValueError(
-                "El mensaje extraído no coincide con el hash original. Podría estar corrupto o incompleto.")
-
-        log_debug(f"Decodificación completada con éxito: {len(decrypted_message)} bytes recuperados")
-        return decrypted_message
+        log_debug(f"Decodificación completada con éxito: {len(decoded_messages)} mensajes recuperados")
+        return decoded_messages
