@@ -6,6 +6,7 @@ import numpy as np
 from PIL import Image
 from stego_lib.formats.header import StegoHeader
 from stego_lib.utils.debug import log_debug, time_it
+from stego_lib.utils.lock_manager import ImageLockManager
 
 
 class ImageContainer:
@@ -24,6 +25,7 @@ class ImageContainer:
         self.bits_per_channel = bits_per_channel
         self.mask = (1 << bits_per_channel) - 1
         self.inverse_mask = 0xFF & ~self.mask
+        self.lock_manager = ImageLockManager()
 
     def calculate_capacity(self, image_path):
         """
@@ -196,71 +198,75 @@ class ImageContainer:
             bool: True si la operación fue exitosa
         """
         try:
-            # Cargar la imagen
-            img = Image.open(input_path).convert('RGB')
-            width, height = img.size
+            # Para la lectura inicial usamos un lock de lectura en la imagen de entrada
+            with self.lock_manager.acquire_read_lock(input_path):
+                # Cargar la imagen
+                img = Image.open(input_path).convert('RGB')
+                width, height = img.size
 
-            # Convertir a numpy array para procesar más rápido
-            pixels = np.array(img)
-            pixels_flat = pixels.reshape(-1)
+                # Convertir a numpy array para procesar más rápido
+                pixels = np.array(img)
+                pixels_flat = pixels.reshape(-1)
 
-            # Encontrar segmentos ya utilizados
-            used_segments = self.find_used_segments(input_path)
+                # Encontrar segmentos ya utilizados
+                used_segments = self.find_used_segments(input_path)
 
-            # Calcular el primer byte libre
-            next_free_byte = 0
-            for offset, size in used_segments:
-                next_free_byte = max(next_free_byte, offset + size)
+                # Calcular el primer byte libre
+                next_free_byte = 0
+                for offset, size in used_segments:
+                    next_free_byte = max(next_free_byte, offset + size)
 
-            # Verificar que hay espacio suficiente
-            max_bytes = (len(pixels_flat) * self.bits_per_channel) // 8
-            if next_free_byte + len(data) > max_bytes:
-                raise ValueError(f"No hay suficiente espacio en la imagen para {len(data)} bytes")
+                # Verificar que hay espacio suficiente
+                max_bytes = (len(pixels_flat) * self.bits_per_channel) // 8
+                if next_free_byte + len(data) > max_bytes:
+                    raise ValueError(f"No hay suficiente espacio en la imagen para {len(data)} bytes")
 
-            # Convertir los datos a bits
-            bits = []
-            for byte in data:
-                for i in range(7, -1, -1):
-                    bits.append((byte >> i) & 1)
+                # Convertir los datos a bits
+                bits = []
+                for byte in data:
+                    for i in range(7, -1, -1):
+                        bits.append((byte >> i) & 1)
 
-            # Rellenar con ceros si es necesario para completar un byte
-            if len(bits) % self.bits_per_channel != 0:
-                bits.extend([0] * (self.bits_per_channel - (len(bits) % self.bits_per_channel)))
+                # Rellenar con ceros si es necesario para completar un byte
+                if len(bits) % self.bits_per_channel != 0:
+                    bits.extend([0] * (self.bits_per_channel - (len(bits) % self.bits_per_channel)))
 
-            # Calcular qué bits tenemos que modificar
-            start_bit = next_free_byte * 8
+                # Calcular qué bits tenemos que modificar
+                start_bit = next_free_byte * 8
 
-            # Modificar solo los bits necesarios
-            bit_index = 0
-            for i in range(len(pixels_flat)):
-                # Calcular el índice del bit en la secuencia plana
-                current_bit = i * self.bits_per_channel
+                # Modificar solo los bits necesarios
+                bit_index = 0
+                for i in range(len(pixels_flat)):
+                    # Calcular el índice del bit en la secuencia plana
+                    current_bit = i * self.bits_per_channel
 
-                # Si estamos antes del inicio o ya terminamos, continuar
-                if current_bit < start_bit:
-                    continue
-                if bit_index >= len(bits):
-                    break
-
-                # Limpiar los bits que vamos a modificar
-                pixels_flat[i] = pixels_flat[i] & self.inverse_mask
-
-                # Escribir los nuevos bits
-                bits_to_write = min(self.bits_per_channel, len(bits) - bit_index)
-                for j in range(bits_to_write):
-                    pixels_flat[i] |= (bits[bit_index] << j)
-                    bit_index += 1
+                    # Si estamos antes del inicio o ya terminamos, continuar
+                    if current_bit < start_bit:
+                        continue
                     if bit_index >= len(bits):
                         break
 
-            # Reconstruir la imagen
-            stego_img = Image.fromarray(pixels.reshape(height, width, 3))
+                    # Limpiar los bits que vamos a modificar
+                    pixels_flat[i] = pixels_flat[i] & self.inverse_mask
 
-            # Guardar la imagen resultante
-            stego_img.save(output_path, quality=100)
+                    # Escribir los nuevos bits
+                    bits_to_write = min(self.bits_per_channel, len(bits) - bit_index)
+                    for j in range(bits_to_write):
+                        pixels_flat[i] |= (bits[bit_index] << j)
+                        bit_index += 1
+                        if bit_index >= len(bits):
+                            break
 
-            log_debug(f"Datos escritos en {output_path}: {len(data)} bytes a partir del byte {next_free_byte}")
-            return True
+            # Para la escritura en la imagen de salida usamos un lock de escritura
+            with self.lock_manager.acquire_write_lock(output_path):
+                # Reconstruir la imagen
+                stego_img = Image.fromarray(pixels.reshape(height, width, 3))
+
+                # Guardar la imagen resultante
+                stego_img.save(output_path, quality=100)
+
+                log_debug(f"Datos escritos en {output_path}: {len(data)} bytes a partir del byte {next_free_byte}")
+                return True
         except Exception as e:
             raise IOError(f"Error al escribir datos en {input_path}: {e}")
 
@@ -316,36 +322,38 @@ class ImageContainer:
             list: Lista de mensajes extraídos
         """
         try:
-            # Extraer todos los bits
-            raw_data = self.extract_all_bits(image_path)
-            if not raw_data or len(raw_data) < StegoHeader.SIZE:
-                return []
+            # Adquirir lock de lectura
+            with self.lock_manager.acquire_read_lock(image_path):
+                # Extraer todos los bits
+                raw_data = self.extract_all_bits(image_path)
+                if not raw_data or len(raw_data) < StegoHeader.SIZE:
+                    return []
 
-            # Buscar todos los mensajes
-            messages = []
-            offset = 0
+                # Buscar todos los mensajes
+                messages = []
+                offset = 0
 
-            while offset + StegoHeader.SIZE <= len(raw_data):
-                try:
-                    header = StegoHeader.parse(raw_data[offset:offset + StegoHeader.SIZE])
+                while offset + StegoHeader.SIZE <= len(raw_data):
+                    try:
+                        header = StegoHeader.parse(raw_data[offset:offset + StegoHeader.SIZE])
 
-                    # Determinar cuánto del mensaje está en esta imagen
-                    message_part_size = min(
-                        len(raw_data) - offset - StegoHeader.SIZE,
-                        header.total_length - header.current_offset
-                    )
+                        # Determinar cuánto del mensaje está en esta imagen
+                        message_part_size = min(
+                            len(raw_data) - offset - StegoHeader.SIZE,
+                            header.total_length - header.current_offset
+                        )
 
-                    # Extraer el mensaje completo
-                    message_data = raw_data[offset:offset + StegoHeader.SIZE + message_part_size]
-                    messages.append(message_data)
+                        # Extraer el mensaje completo
+                        message_data = raw_data[offset:offset + StegoHeader.SIZE + message_part_size]
+                        messages.append(message_data)
 
-                    # Saltar al siguiente posible mensaje
-                    offset += StegoHeader.SIZE + message_part_size
-                except Exception:
-                    # Si no podemos parsear el encabezado, avanzamos un byte
-                    offset += 1
+                        # Saltar al siguiente posible mensaje
+                        offset += StegoHeader.SIZE + message_part_size
+                    except Exception:
+                        # Si no podemos parsear el encabezado, avanzamos un byte
+                        offset += 1
 
-            return messages
+                return messages
 
         except Exception as e:
             raise IOError(f"Error al leer datos de {image_path}: {e}")

@@ -27,7 +27,6 @@ class StegoEncoder:
         self.cipher = MessageCipher(password) if password else None
         self.container = ImageContainer(bits_per_channel=bits_per_channel)
 
-    @time_it
     def encode(self, message, directory):
         """
         Oculta un mensaje en un directorio de imágenes PNG.
@@ -61,11 +60,10 @@ class StegoEncoder:
                       f"Disponible: {available} bytes")
 
         # Ordenar imágenes por espacio USADO (de mayor a menor)
-        # Esto hace que se llene primero una imagen antes de pasar a la siguiente
         sorted_images = sorted(
             [(img_path, space_info[img_path][1]) for img_path in image_paths if space_info[img_path][1] > 0],
-            key=lambda x: space_info[x[0]][0],  # Ordenar por bytes usados (columna 0 de space_info)
-            reverse=True  # Imágenes más llenas primero
+            key=lambda x: space_info[x[0]][0],
+            reverse=True
         )
 
         if not sorted_images or sum(available for _, available in sorted_images) < len(message):
@@ -95,13 +93,13 @@ class StegoEncoder:
 
             # Crear encabezado con el offset correcto
             header = StegoHeader.create(
-                total_message_length=len(message),  # Longitud total del mensaje original
-                current_offset=current_offset,  # Posición actual dentro del mensaje
+                total_message_length=len(message),
+                current_offset=current_offset,
                 message_hash=message_hash,
-                message_id=message_id  # Mantener el mismo ID para todos los fragmentos
+                message_id=message_id
             )
 
-            # Escribir fragmento en la imagen
+            # Escribir fragmento en la imagen - ya maneja locks internamente
             self.container.write_data(img_path, img_path, header + remaining_message[:bytes_to_write])
             modified_images.append(img_path)
 
